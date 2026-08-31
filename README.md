@@ -43,6 +43,8 @@ Leave that window up. Another shell, same PATH + cwd:
 .\talk.ps1 status
 .\target\debug\thinner-floor.exe query on-screen
 .\talk.ps1 paint 0.85 0.15 0.55
+.\talk.ps1 add sphere
+.\talk.ps1 add box -Id box-2 -X 1.2 -Y 0.5 -Z 0
 ```
 
 Do not `cargo run -- status` while the exe is locked.

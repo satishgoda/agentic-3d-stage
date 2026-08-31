@@ -33,11 +33,18 @@ Window title **Thinner Floor**. First picture: terracotta box on a grey ground. 
 .\talk.ps1 inspect
 .\target\debug\thinner-floor.exe query on-screen
 .\talk.ps1 paint 0.2 0.8 0.35
+.\talk.ps1 add sphere
+.\talk.ps1 add box -Id box-2 -X 1.2 -Y 0.5 -Z 0
+.\talk.ps1 add plane
+.\talk.ps1 move box-2 -X 0.4 -Y 0.5 -Z 0
+.\talk.ps1 undo
 ```
 
-Apply needs the live revision from `status` if you send raw JSON (`--base-revision`). `talk.ps1 paint` does that for you.
+Recipes: **box**, **sphere**, **plane** (`create_mesh` on the mailbox). There is no in-window “add object” panel in this public tree (learn-studio stayed private). `talk.ps1 add` is the sit path.
 
-PowerShell often eats `--change` JSON. Prefer `talk.ps1` or a here-string. See the private how-to in `thinner-floor` for the full apply grammar.
+Apply needs the live revision from `status` if you send raw JSON (`--base-revision`). `talk.ps1` does that for you.
+
+PowerShell often eats `--change` JSON. Prefer `talk.ps1` or a here-string.
 
 ## Cycles overlay
 
