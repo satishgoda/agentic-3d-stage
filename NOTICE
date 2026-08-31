@@ -1,0 +1,14 @@
+Agentic 3D Stage
+=================
+
+Sit (Rust, this repository)
+  License: MIT (see LICENSE)
+  Binary / crate name: thinner-floor
+
+Cycles worker
+  Source: the Blender Cycles tree, vendored as git submodule
+    third_party/cycles  →  https://github.com/blender/cycles
+  License: Apache License 2.0 (see third_party/cycles/LICENSE)
+  Copyright: Blender Foundation
+  Our addition: patches/cycles/0001-cycles-stream.patch
+    (cycles-stream daemon + CMake target; not part of upstream Cycles)

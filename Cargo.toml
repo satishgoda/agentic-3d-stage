@@ -1,0 +1,22 @@
+[package]
+name = "thinner-floor"
+version = "0.1.0"
+edition = "2021"
+description = "Agentic 3D Stage sit: wgpu window + versioned JSON + mailbox + optional Cycles overlay"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+interprocess = "2"
+glam = "0.29"
+png = "0.17"
+sha2 = "0.10"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "24.0"
+winit = "0.30"
+
+[profile.dev]
+opt-level = 1

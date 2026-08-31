@@ -1,0 +1,11 @@
+/target/
+/thinner-floor.json
+*.token
+*.swp
+.DS_Store
+/sits/
+/renders/
+/third_party/cycles/build/
+/third_party/cycles/install/
+node_modules/
+*.tar

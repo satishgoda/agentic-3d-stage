@@ -1,0 +1,517 @@
+diff --git a/src/app/CMakeLists.txt b/src/app/CMakeLists.txt
+index a04fd6009..acf3cbb4d 100644
+--- a/src/app/CMakeLists.txt
++++ b/src/app/CMakeLists.txt
+@@ -142,6 +142,17 @@ if(WITH_CYCLES_STANDALONE)
+   add_test(
+     NAME cycles_version
+     COMMAND ${app_install_dir}/$<TARGET_FILE_NAME:cycles> --version)
++
++  add_executable(cycles-stream
++    cycles_stream.cpp
++    cycles_xml.cpp
++    cycles_xml.h
++  )
++  target_link_libraries(cycles-stream PRIVATE ${LIB})
++  if(CYCLES_STANDALONE_REPOSITORY)
++    cycles_install_libraries(cycles-stream)
++  endif()
++  install(TARGETS cycles-stream DESTINATION ${app_install_dir})
+ endif()
+ 
+ if(WITH_CYCLES_PRECOMPUTE)
+diff --git a/src/app/cycles_stream.cpp b/src/app/cycles_stream.cpp
+new file mode 100644
+index 000000000..f012ae9d4
+--- /dev/null
++++ b/src/app/cycles_stream.cpp
+@@ -0,0 +1,489 @@
++/* SPDX-FileCopyrightText: 2026 Satish Goda / thinner-floor sidecar
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Idle Cycles daemon: TCP 127.0.0.1:17422 JSON lines (start/pause/resume/stop/quit)
++ * plus a named shared-memory framebuffer updated every sample.
++ */
++
++#ifdef _WIN32
++#  ifndef WIN32_LEAN_AND_MEAN
++#    define WIN32_LEAN_AND_MEAN
++#  endif
++#  include <winsock2.h>
++#  include <ws2tcpip.h>
++#  include <windows.h>
++#  pragma comment(lib, "ws2_32.lib")
++#endif
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++#include "device/device.h"
++#include "scene/camera.h"
++#include "scene/pass.h"
++#include "scene/scene.h"
++#include "session/buffers.h"
++#include "session/output_driver.h"
++#include "session/session.h"
++
++#include "app/cycles_xml.h"
++
++#include "util/log.h"
++#include "util/path.h"
++#include "util/string.h"
++#include "util/system.h"
++#include "util/unique_ptr.h"
++#include "util/vector.h"
++
++CCL_NAMESPACE_BEGIN
++
++static const uint32_t kMagic = 0x54464359; /* TFYC */
++static const uint32_t kHeader = 256;
++static const uint32_t kMaxW = 1920;
++static const uint32_t kMaxH = 1080;
++static const wchar_t kMapName[] = L"Local\\ThinnerFloorCyclesFb";
++
++enum Flag : uint32_t {
++  FLAG_HAS_FRAME = 1u,
++  FLAG_RUNNING = 2u,
++  FLAG_PAUSED = 4u,
++  FLAG_DONE = 8u,
++  FLAG_ERROR = 16u,
++};
++
++struct FbHeader {
++  uint32_t magic;
++  uint32_t width;
++  uint32_t height;
++  uint32_t sample;
++  uint32_t seq;
++  uint32_t flags;
++  uint32_t stride;
++  uint32_t reserved[57];
++};
++
++static_assert(sizeof(FbHeader) == 256, "header must be 256 bytes");
++
++struct StreamState {
++  HANDLE map = nullptr;
++  uint8_t *view = nullptr;
++  unique_ptr<Session> session;
++  string xml;
++  int samples = 64;
++  int width = 960;
++  int height = 640;
++  bool want_quit = false;
++};
++
++static StreamState g;
++
++static size_t fb_bytes()
++{
++  return kHeader + size_t(kMaxW) * kMaxH * 4;
++}
++
++static FbHeader *hdr()
++{
++  return reinterpret_cast<FbHeader *>(g.view);
++}
++
++static uint8_t *pixels()
++{
++  return g.view + kHeader;
++}
++
++static void fb_flags(uint32_t add, uint32_t remove)
++{
++  if (!g.view) {
++    return;
++  }
++  uint32_t f = hdr()->flags;
++  f |= add;
++  f &= ~remove;
++  hdr()->flags = f;
++}
++
++class StreamOutputDriver : public OutputDriver {
++ public:
++  void write_render_tile(const Tile &tile) override
++  {
++    update_render_tile(tile);
++    fb_flags(FLAG_DONE, FLAG_RUNNING);
++  }
++
++  bool update_render_tile(const Tile &tile) override
++  {
++    if (!g.view) {
++      return false;
++    }
++    if (tile.size.x <= 0 || tile.size.y <= 0) {
++      return false;
++    }
++    const int w = tile.size.x;
++    const int h = tile.size.y;
++    if (w > (int)kMaxW || h > (int)kMaxH) {
++      return false;
++    }
++    vector<float> rgba(size_t(w) * h * 4);
++    if (!tile.get_pass_pixels("combined", 4, rgba.data())) {
++      return false;
++    }
++    FbHeader *hdrv = hdr();
++    uint8_t *dst = pixels();
++    const uint32_t stride = uint32_t(w) * 4;
++    for (int y = 0; y < h; y++) {
++      const int src_y = h - 1 - y;
++      const float *row = rgba.data() + size_t(src_y) * w * 4;
++      uint8_t *out = dst + size_t(y) * stride;
++      for (int x = 0; x < w; x++) {
++        auto enc = [](float v) {
++          v = std::max(0.0f, std::min(1.0f, std::pow(std::max(v, 0.0f), 1.0f / 2.2f)));
++          return (uint8_t)std::lround(v * 255.0f);
++        };
++        out[x * 4 + 0] = enc(row[x * 4 + 0]);
++        out[x * 4 + 1] = enc(row[x * 4 + 1]);
++        out[x * 4 + 2] = enc(row[x * 4 + 2]);
++        out[x * 4 + 3] = 255;
++      }
++    }
++    hdrv->magic = kMagic;
++    hdrv->width = uint32_t(w);
++    hdrv->height = uint32_t(h);
++    hdrv->stride = stride;
++    hdrv->sample += 1;
++    MemoryBarrier();
++    hdrv->seq += 1;
++    hdrv->flags = FLAG_HAS_FRAME | FLAG_RUNNING;
++    return true;
++  }
++};
++
++static bool open_fb()
++{
++  const size_t bytes = fb_bytes();
++  g.map = CreateFileMappingW(
++      INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, (DWORD)bytes, kMapName);
++  if (!g.map) {
++    fprintf(stderr, "cycles-stream: CreateFileMapping failed %lu\n", GetLastError());
++    return false;
++  }
++  g.view = (uint8_t *)MapViewOfFile(g.map, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
++  if (!g.view) {
++    fprintf(stderr, "cycles-stream: MapViewOfFile failed %lu\n", GetLastError());
++    return false;
++  }
++  memset(g.view, 0, bytes);
++  hdr()->magic = kMagic;
++  return true;
++}
++
++static SessionParams cpu_params(int samples)
++{
++  SessionParams p;
++  /* Finish the session when samples are done, but keep display updates on.
++   * headless=true skips OutputDriver::update_render_tile until write_render_tile
++   * at the end — the wgpu overlay would freeze until all spp finished. */
++  p.background = true;
++  p.headless = false;
++  p.samples = samples;
++  p.threads = 0;
++  p.use_auto_tile = false;
++  p.use_resolution_divider = false;
++  p.tile_size = 0;
++  const DeviceType t = Device::type_from_string("CPU");
++  vector<DeviceInfo> devices = Device::available_devices(DEVICE_MASK(t));
++  if (devices.empty()) {
++    fprintf(stderr, "cycles-stream: no CPU device\n");
++  }
++  else {
++    p.device = devices.front();
++  }
++  return p;
++}
++
++static BufferParams buf_params(int w, int h)
++{
++  BufferParams b;
++  b.width = w;
++  b.height = h;
++  b.full_width = w;
++  b.full_height = h;
++  return b;
++}
++
++static void stop_session()
++{
++  if (g.session) {
++    g.session->cancel(true);
++    g.session->set_pause(false);
++    g.session.reset();
++  }
++  fb_flags(0, FLAG_RUNNING | FLAG_PAUSED);
++}
++
++static string json_str(const string &j, const char *key)
++{
++  const string pat = string("\"") + key + "\"";
++  size_t p = j.find(pat);
++  if (p == string::npos) {
++    return "";
++  }
++  p = j.find(':', p);
++  if (p == string::npos) {
++    return "";
++  }
++  p = j.find('"', p);
++  if (p == string::npos) {
++    return "";
++  }
++  const size_t e = j.find('"', p + 1);
++  if (e == string::npos) {
++    return "";
++  }
++  return j.substr(p + 1, e - p - 1);
++}
++
++static int json_int(const string &j, const char *key, int def)
++{
++  const string pat = string("\"") + key + "\"";
++  size_t p = j.find(pat);
++  if (p == string::npos) {
++    return def;
++  }
++  p = j.find(':', p);
++  if (p == string::npos) {
++    return def;
++  }
++  return atoi(j.c_str() + p + 1);
++}
++
++static string json_op(const string &j)
++{
++  return json_str(j, "op");
++}
++
++static string handle_line(const string &line)
++{
++  const string op = json_op(line);
++  if (op == "status") {
++    const char *st = "idle";
++    if (hdr()->flags & FLAG_RUNNING) {
++      st = (hdr()->flags & FLAG_PAUSED) ? "paused" : "running";
++    }
++    else if (hdr()->flags & FLAG_DONE) {
++      st = "done";
++    }
++    char buf[256];
++    snprintf(buf,
++             sizeof(buf),
++             "{\"ok\":true,\"state\":\"%s\",\"sample\":%u,\"width\":%u,\"height\":%u,\"seq\":%u}",
++             st,
++             hdr()->sample,
++             hdr()->width,
++             hdr()->height,
++             hdr()->seq);
++    return buf;
++  }
++  if (op == "quit") {
++    stop_session();
++    g.want_quit = true;
++    return "{\"ok\":true,\"state\":\"quit\"}";
++  }
++  if (op == "stop") {
++    stop_session();
++    fb_flags(FLAG_DONE, FLAG_RUNNING | FLAG_PAUSED);
++    return "{\"ok\":true,\"state\":\"idle\"}";
++  }
++  if (op == "pause") {
++    if (g.session) {
++      g.session->set_pause(true);
++      fb_flags(FLAG_PAUSED, 0);
++    }
++    return "{\"ok\":true,\"state\":\"paused\"}";
++  }
++  if (op == "resume") {
++    if (g.session) {
++      g.session->set_pause(false);
++      fb_flags(FLAG_RUNNING, FLAG_PAUSED);
++    }
++    return "{\"ok\":true,\"state\":\"running\"}";
++  }
++  if (op == "start") {
++    string xml = json_str(line, "xml");
++    if (xml.empty()) {
++      return "{\"ok\":false,\"error\":\"missing xml\"}";
++    }
++    g.samples = json_int(line, "samples", 64);
++    g.width = json_int(line, "width", 960);
++    g.height = json_int(line, "height", 640);
++    g.xml = xml;
++    stop_session();
++    hdr()->sample = 0;
++    hdr()->seq = hdr()->seq; /* keep */
++    fb_flags(FLAG_RUNNING, FLAG_DONE | FLAG_PAUSED | FLAG_ERROR);
++    SceneParams scene_params;
++    scene_params.shadingsystem = SHADINGSYSTEM_SVM;
++    scene_params.background = true;
++    SessionParams sp = cpu_params(g.samples);
++    g.session = make_unique<Session>(sp, scene_params);
++    g.session->set_output_driver(make_unique<StreamOutputDriver>());
++    xml_read_file(g.session->scene.get(), g.xml.c_str());
++    g.session->scene->camera->set_full_width(g.width);
++    g.session->scene->camera->set_full_height(g.height);
++    g.session->scene->camera->compute_auto_viewplane();
++    Pass *pass = g.session->scene->create_node<Pass>();
++    pass->set_name(ustring("combined"));
++    pass->set_type(PASS_COMBINED);
++    g.session->reset(sp, buf_params(g.width, g.height));
++    g.session->start();
++    return "{\"ok\":true,\"state\":\"running\"}";
++  }
++  return "{\"ok\":false,\"error\":\"unknown_op\"}";
++}
++
++static bool send_all(SOCKET s, const string &msg)
++{
++  string line = msg + "\n";
++  const char *p = line.c_str();
++  int left = (int)line.size();
++  while (left > 0) {
++    int n = send(s, p, left, 0);
++    if (n <= 0) {
++      return false;
++    }
++    p += n;
++    left -= n;
++  }
++  return true;
++}
++
++static void serve(const char *host, int port)
++{
++  WSADATA wsa;
++  WSAStartup(MAKEWORD(2, 2), &wsa);
++  SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++  int yes = 1;
++  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
++  sockaddr_in addr{};
++  addr.sin_family = AF_INET;
++  addr.sin_port = htons((u_short)port);
++  inet_pton(AF_INET, host, &addr.sin_addr);
++  if (bind(ls, (sockaddr *)&addr, sizeof(addr)) != 0) {
++    fprintf(stderr, "cycles-stream: bind failed %d\n", WSAGetLastError());
++    return;
++  }
++  listen(ls, 4);
++  printf("cycles-stream listen %s:%d\n", host, port);
++  fflush(stdout);
++
++  SOCKET clients[8];
++  string bufs[8];
++  for (int i = 0; i < 8; i++) {
++    clients[i] = INVALID_SOCKET;
++  }
++
++  while (!g.want_quit) {
++    fd_set rfds;
++    FD_ZERO(&rfds);
++    FD_SET(ls, &rfds);
++    int maxfd = (int)ls;
++    for (int i = 0; i < 8; i++) {
++      if (clients[i] != INVALID_SOCKET) {
++        FD_SET(clients[i], &rfds);
++        if ((int)clients[i] > maxfd) {
++          maxfd = (int)clients[i];
++        }
++      }
++    }
++    timeval tv{0, 50000};
++    int n = select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
++    if (n < 0) {
++      continue;
++    }
++    if (FD_ISSET(ls, &rfds)) {
++      SOCKET c = accept(ls, nullptr, nullptr);
++      if (c != INVALID_SOCKET) {
++        for (int i = 0; i < 8; i++) {
++          if (clients[i] == INVALID_SOCKET) {
++            clients[i] = c;
++            bufs[i].clear();
++            c = INVALID_SOCKET;
++            break;
++          }
++        }
++        if (c != INVALID_SOCKET) {
++          closesocket(c);
++        }
++      }
++    }
++    for (int i = 0; i < 8; i++) {
++      if (clients[i] == INVALID_SOCKET || !FD_ISSET(clients[i], &rfds)) {
++        continue;
++      }
++      char tmp[1024];
++      int r = recv(clients[i], tmp, sizeof(tmp), 0);
++      if (r <= 0) {
++        closesocket(clients[i]);
++        clients[i] = INVALID_SOCKET;
++        bufs[i].clear();
++        continue;
++      }
++      bufs[i].append(tmp, r);
++      size_t nl;
++      while ((nl = bufs[i].find('\n')) != string::npos) {
++        string line = bufs[i].substr(0, nl);
++        if (!line.empty() && line.back() == '\r') {
++          line.pop_back();
++        }
++        bufs[i].erase(0, nl + 1);
++        string resp = handle_line(line);
++        if (!send_all(clients[i], resp)) {
++          closesocket(clients[i]);
++          clients[i] = INVALID_SOCKET;
++          bufs[i].clear();
++          break;
++        }
++      }
++    }
++  }
++  stop_session();
++  closesocket(ls);
++  WSACleanup();
++}
++
++CCL_NAMESPACE_END
++
++int main(const int argc, const char **argv)
++{
++  using namespace ccl;
++  log_init(nullptr);
++  path_init();
++  system_max_open_files_ensure();
++  const char *host = "127.0.0.1";
++  int port = 17422;
++  for (int i = 1; i < argc; i++) {
++    if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
++      string spec = argv[++i];
++      const size_t c = spec.rfind(':');
++      if (c != string::npos) {
++        host = _strdup(spec.substr(0, c).c_str());
++        port = atoi(spec.c_str() + c + 1);
++      }
++    }
++  }
++  if (!open_fb()) {
++    return 1;
++  }
++  serve(host, port);
++  if (g.view) {
++    UnmapViewOfFile(g.view);
++  }
++  if (g.map) {
++    CloseHandle(g.map);
++  }
++  return 0;
++}
